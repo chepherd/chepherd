@@ -231,6 +231,13 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		resp := s.dispatchWithAgent(&req, connAgent)
+		// JSON-RPC 2.0 §4.1 — a notification (no "id") MUST NOT be
+		// answered. Replying produces an id-less {"result":…} frame that
+		// fails client-side schema validation and tears down the whole
+		// MCP connection (see the matching guard in BridgeStdioToHTTP).
+		if req.ID == nil {
+			continue
+		}
 		if err := c.WriteJSON(resp); err != nil {
 			return
 		}
@@ -390,6 +397,28 @@ func BridgeStdioToHTTP(url string) error {
 			_, frame, err := c.ReadMessage()
 			if err != nil {
 				return
+			}
+			// JSON-RPC 2.0: a NOTIFICATION (request with no "id") must
+			// never be answered. handleWS dispatches every inbound frame
+			// and writes a response unconditionally, so a client
+			// notification (e.g. "notifications/initialized", which
+			// claude-code sends right after initialize) comes back as
+			// {"jsonrpc":"2.0","result":{…}} with no "id" and no
+			// "method". That frame matches neither the Request nor the
+			// Response shape in the client's schema, so claude-code
+			// fails validation and DROPS the whole stdio connection
+			// ("STDIO connection dropped after 0s uptime") — every
+			// chepherd.* tool then silently disappears from the agent's
+			// context and it reports "/mcp not connected, can't reach
+			// peers". Swallow those orphan frames here so the agent only
+			// ever sees well-formed traffic.
+			var probe struct {
+				ID     json.RawMessage `json:"id"`
+				Method string          `json:"method"`
+			}
+			if err := json.Unmarshal(frame, &probe); err == nil &&
+				len(probe.ID) == 0 && probe.Method == "" {
+				continue
 			}
 			// Each WS frame is one JSON-RPC response; emit newline-terminated
 			// so the agent's MCP client splits them correctly.
